@@ -1,0 +1,31 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: craft-service
+  datasource:
+    # Zero-setup local profile: embedded H2 in MySQL compatibility mode.
+    # For production/MySQL use: --spring.profiles.active=mysql
+    url: jdbc:h2:mem:craftdb;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      transaction-isolation: TRANSACTION_READ_COMMITTED
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-h2.sql
+      data-locations: classpath:data-seed.sql
+      # H2 in-mem with DB_CLOSE_DELAY=-1 is shared across application contexts
+      # (integration tests restart the context); idempotent seed on 2nd startup.
+      continue-on-error: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+app:
+  # Idempotency records left IN_FLIGHT longer than this (process crash) are ignored.
+  in-flight-ttl-seconds: 300
+  token-ttl-hours: 12
