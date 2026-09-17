@@ -6,7 +6,10 @@ import com.gameops.craft.repo.LedgerRepository;
 import com.gameops.craft.repo.OrderRepository;
 import com.gameops.craft.service.CraftService;
 import com.gameops.craft.service.CraftTxService;
+import com.gameops.craft.service.PlanService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.servlet.http.HttpServletRequest;
@@ -28,15 +31,18 @@ public class PlayerController {
 
     private final CraftService craft;
     private final CraftTxService tx;
+    private final PlanService plans;
     private final InventoryRepository inventory;
     private final OrderRepository orders;
     private final LedgerRepository ledger;
     private final HoldRepository holds;
 
-    public PlayerController(CraftService craft, CraftTxService tx, InventoryRepository inventory,
-                            OrderRepository orders, LedgerRepository ledger, HoldRepository holds) {
+    public PlayerController(CraftService craft, CraftTxService tx, PlanService plans,
+                            InventoryRepository inventory, OrderRepository orders,
+                            LedgerRepository ledger, HoldRepository holds) {
         this.craft = craft;
         this.tx = tx;
+        this.plans = plans;
         this.inventory = inventory;
         this.orders = orders;
         this.ledger = ledger;
@@ -46,6 +52,9 @@ public class PlayerController {
     public record PreoccupyRequest(@NotNull Long recipeId) {}
     public record CommitRequest(@NotBlank String orderNo) {}
     public record CancelRequest(@NotBlank String orderNo, String reason) {}
+    public record CreatePlanRequest(@NotNull Long recipeId,
+                                    @NotNull @Min(1) @Max(100) Integer count) {}
+    public record CancelPlanRequest(@NotBlank String planNo, String reason) {}
 
     @GetMapping("/recipes")
     public List<Map<String, Object>> recipeCatalog(HttpServletRequest request) {
@@ -75,6 +84,37 @@ public class PlayerController {
     @PostMapping("/crafts/cancel")
     public Map<String, Object> cancel(@Valid @RequestBody CancelRequest req, HttpServletRequest request) {
         return craft.cancel(CurrentUsers.from(request).userId(), req.orderNo(), req.reason());
+    }
+
+    // ---- batch plans -------------------------------------------------------
+
+    /**
+     * Create a batch synthesis plan (1..100 units). Requires Idempotency-Key:
+     * concurrent submissions sharing a key create exactly one plan. Workers —
+     * not client calls — execute the units; there is intentionally no loop here.
+     */
+    @PostMapping("/plans")
+    public Map<String, Object> createPlan(@Valid @RequestBody CreatePlanRequest req,
+                                          @RequestHeader(value = "Idempotency-Key", required = false) String key,
+                                          HttpServletRequest request) {
+        return plans.createPlan(CurrentUsers.from(request).userId(),
+                req.recipeId(), req.count(), key);
+    }
+
+    @PostMapping("/plans/cancel")
+    public Map<String, Object> cancelPlan(@Valid @RequestBody CancelPlanRequest req,
+                                          HttpServletRequest request) {
+        return plans.cancelPlan(CurrentUsers.from(request).userId(), req.planNo(), req.reason());
+    }
+
+    @GetMapping("/plans")
+    public List<Map<String, Object>> myPlans(HttpServletRequest request) {
+        return plans.listPlayerPlans(CurrentUsers.from(request).userId(), 100);
+    }
+
+    @GetMapping("/plans/{planNo}")
+    public Map<String, Object> planDetail(@PathVariable String planNo, HttpServletRequest request) {
+        return plans.planDetail(CurrentUsers.from(request).userId(), planNo);
     }
 
     @GetMapping("/crafts")

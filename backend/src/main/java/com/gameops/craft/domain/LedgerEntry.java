@@ -10,6 +10,8 @@ public record LedgerEntry(
         String entryType,
         long qtyDelta,
         String relatedRef,
+        String planNo,
+        Integer unitNo,
         String status,
         String remark,
         Instant createdAt

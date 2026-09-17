@@ -13,7 +13,8 @@ const cls = computed(() => {
     RELEASE: 'info',
     GRANT: 'info',
     REVOKE: 'bad',
-    REVOKE_PENDING: 'warn'
+    REVOKE_PENDING: 'warn',
+    COMPENSATE: 'ok'
   }[props.type] || ''
 })
 </script>

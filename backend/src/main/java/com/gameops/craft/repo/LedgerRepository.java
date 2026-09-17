@@ -23,20 +23,31 @@ public class LedgerRepository {
 
     private static LedgerEntry map(ResultSet rs) throws SQLException {
         Timestamp created = rs.getTimestamp("created_at");
+        Integer unitNo = (Integer) rs.getObject("unit_no");
         return new LedgerEntry(rs.getLong("id"), rs.getString("ref_no"), rs.getLong("player_id"),
                 rs.getString("item_code"), rs.getString("entry_type"), rs.getLong("qty_delta"),
-                rs.getString("related_ref"), rs.getString("status"), rs.getString("remark"),
+                rs.getString("related_ref"), rs.getString("plan_no"), unitNo,
+                rs.getString("status"), rs.getString("remark"),
                 created == null ? null : created.toInstant());
     }
 
     public void insert(String refNo, long playerId, String itemCode, String entryType,
                        long qtyDelta, String relatedRef, String status, String remark, Instant now) {
+        insert(refNo, playerId, itemCode, entryType, qtyDelta, relatedRef, null, null,
+                status, remark, now);
+    }
+
+    /** Full form used by batch-plan units: every movement carries plan_no/unit_no. */
+    public void insert(String refNo, long playerId, String itemCode, String entryType,
+                       long qtyDelta, String relatedRef, String planNo, Integer unitNo,
+                       String status, String remark, Instant now) {
         jdbc.update("""
                 INSERT INTO ledger_entry
-                  (ref_no, player_id, item_code, entry_type, qty_delta, related_ref, status, remark, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, refNo, playerId, itemCode, entryType, qtyDelta, relatedRef, status, remark,
-                Timestamp.from(now));
+                  (ref_no, player_id, item_code, entry_type, qty_delta, related_ref,
+                   plan_no, unit_no, status, remark, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, refNo, playerId, itemCode, entryType, qtyDelta, relatedRef,
+                planNo, unitNo, status, remark, Timestamp.from(now));
     }
 
     public List<LedgerEntry> listByRef(String refNo) {
@@ -59,5 +70,17 @@ public class LedgerRepository {
 
     public List<LedgerEntry> listRecent(int limit) {
         return jdbc.query("SELECT * FROM ledger_entry ORDER BY id DESC LIMIT ?", MAPPER, limit);
+    }
+
+    /** Reconciliation: every posted ledger line of one batch plan (all its units). */
+    public List<LedgerEntry> listByPlanNo(String planNo) {
+        return jdbc.query(
+                "SELECT * FROM ledger_entry WHERE plan_no = ? ORDER BY id", MAPPER, planNo);
+    }
+
+    /** Lines of one unit's order (CONSUME / PRODUCE / RELEASE / compensation all share ref_no). */
+    public List<LedgerEntry> listByRefForUpdate(String refNo) {
+        return jdbc.query(
+                "SELECT * FROM ledger_entry WHERE ref_no = ? ORDER BY id FOR UPDATE", MAPPER, refNo);
     }
 }

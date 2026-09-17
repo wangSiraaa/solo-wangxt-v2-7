@@ -7,6 +7,8 @@ import com.gameops.craft.repo.OrderRepository;
 import com.gameops.craft.repo.RevokeRepository;
 import com.gameops.craft.service.CraftService;
 import com.gameops.craft.service.CraftTxService;
+import com.gameops.craft.service.PlanReconcileService;
+import com.gameops.craft.service.PlanService;
 import com.gameops.craft.service.RecipeAdminService;
 import com.gameops.craft.domain.ItemQty;
 import jakarta.validation.Valid;
@@ -23,6 +25,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -37,17 +40,22 @@ public class OperatorController {
     private final OrderRepository orders;
     private final LedgerRepository ledger;
     private final RevokeRepository revokes;
+    private final PlanService plans;
+    private final PlanReconcileService reconcile;
     private final Clock clock;
 
     public OperatorController(RecipeAdminService recipeAdmin, CraftTxService craftTx,
                               InventoryRepository inventory, OrderRepository orders,
-                              LedgerRepository ledger, RevokeRepository revokes, Clock clock) {
+                              LedgerRepository ledger, RevokeRepository revokes,
+                              PlanService plans, PlanReconcileService reconcile, Clock clock) {
         this.recipeAdmin = recipeAdmin;
         this.craftTx = craftTx;
         this.inventory = inventory;
         this.orders = orders;
         this.ledger = ledger;
         this.revokes = revokes;
+        this.plans = plans;
+        this.reconcile = reconcile;
         this.clock = clock;
     }
 
@@ -58,6 +66,9 @@ public class OperatorController {
     public record CloseRecipeRequest(@NotNull Long recipeId, String reason) {}
     public record RevokeRequest(@NotBlank String orderNo) {}
     public record GrantRequest(@NotNull Long playerId, @NotBlank String itemCode, @PositiveOrZero long qty) {}
+    public record RepairRequest(@NotBlank String planNo, Integer unitNo,
+                                @NotBlank String diffType, @NotBlank String itemCode,
+                                @NotNull Long qty, String remark) {}
 
     // ---- recipe lifecycle --------------------------------------------------
 
@@ -174,5 +185,45 @@ public class OperatorController {
                 null, "POSTED", "运营设置库存", now);
         return Map.of("refNo", refNo, "playerId", req.playerId(),
                 "itemCode", req.itemCode(), "qty", req.qty());
+    }
+
+    // ---- batch plan oversight, reconciliation and append-only repair ------
+
+    @GetMapping("/plans")
+    public List<Map<String, Object>> plans(@RequestParam(defaultValue = "all") String view,
+                                           @RequestParam(defaultValue = "200") int limit) {
+        return "anomalies".equals(view)
+                ? plans.listAnomalousPlans(Math.min(limit, 500))
+                : plans.listRecentPlans(Math.min(limit, 500));
+    }
+
+    @GetMapping("/plans/{planNo}")
+    public Map<String, Object> planDetail(@PathVariable String planNo) {
+        return plans.planDetailOps(planNo);
+    }
+
+    /** Read-only reconciliation of plan status vs. unit orders vs. ledger rows. */
+    @GetMapping("/plans/{planNo}/reconcile")
+    public Map<String, Object> reconcile(@PathVariable String planNo) {
+        return reconcile.reconcilePlan(planNo);
+    }
+
+    /**
+     * Repair a found discrepancy by APPENDING a signed COMPENSATE ledger line
+     * only. Requires Idempotency-Key; retries with the same key post at most one
+     * compensation and replay the original result. Historical rows are untouched.
+     */
+    @PostMapping("/plans/repair")
+    public Map<String, Object> repair(@Valid @RequestBody RepairRequest req,
+                                      @RequestHeader(value = "Idempotency-Key", required = false) String key,
+                                      HttpServletRequest request) {
+        return reconcile.repair(CurrentUsers.from(request).userId(),
+                new PlanReconcileService.RepairRequest(req.planNo(), req.unitNo(),
+                        req.diffType(), req.itemCode(), req.qty(), req.remark()), key);
+    }
+
+    @GetMapping("/repairs")
+    public List<Map<String, Object>> repairs(@RequestParam(required = false) String planNo) {
+        return reconcile.listRepairs(planNo, 200);
     }
 }

@@ -24,7 +24,7 @@ public class OrderRepository {
             SELECT o.id, o.order_no, o.player_id, o.recipe_id, o.recipe_version_id,
                    rv.version_no, r.code AS recipe_code, r.name AS recipe_name,
                    o.status, o.status_reason, o.preoccupy_deadline, o.committed_at,
-                   o.closed_at, o.revoke_ref_no, o.created_at
+                   o.closed_at, o.revoke_ref_no, o.plan_no, o.unit_no, o.created_at
               FROM craft_order o
               JOIN recipe r ON r.id = o.recipe_id
               JOIN recipe_version rv ON rv.id = o.recipe_version_id
@@ -32,11 +32,12 @@ public class OrderRepository {
 
     private static final RowMapper<CraftOrder> MAPPER = (rs, n) -> map(rs);
 
-    private static CraftOrder map(ResultSet rs) throws SQLException {
+    static CraftOrder map(ResultSet rs) throws SQLException {
         Timestamp dl = rs.getTimestamp("preoccupy_deadline");
         Timestamp committed = rs.getTimestamp("committed_at");
         Timestamp closed = rs.getTimestamp("closed_at");
         Timestamp created = rs.getTimestamp("created_at");
+        Integer unitNo = (Integer) rs.getObject("unit_no");
         return new CraftOrder(
                 rs.getLong("id"), rs.getString("order_no"), rs.getLong("player_id"),
                 rs.getLong("recipe_id"), rs.getLong("recipe_version_id"),
@@ -46,18 +47,26 @@ public class OrderRepository {
                 committed == null ? null : committed.toInstant(),
                 closed == null ? null : closed.toInstant(),
                 rs.getString("revoke_ref_no"),
+                rs.getString("plan_no"),
+                unitNo,
                 created == null ? null : created.toInstant());
     }
 
     public long insert(String orderNo, long playerId, long recipeId, long versionId,
                        Instant deadline, Instant now) {
+        return insertWithPlan(orderNo, playerId, recipeId, versionId, deadline, now, null, null);
+    }
+
+    /** Batch-plan orders carry plan_no/unit_no traceability on every column. */
+    public long insertWithPlan(String orderNo, long playerId, long recipeId, long versionId,
+                               Instant deadline, Instant now, String planNo, Integer unitNo) {
         jdbc.update("""
                 INSERT INTO craft_order
                   (order_no, player_id, recipe_id, recipe_version_id, status,
-                   preoccupy_deadline, committed_at, closed_at, created_at)
-                VALUES (?, ?, ?, ?, 'PREOCCUPIED', ?, NULL, NULL, ?)
+                   preoccupy_deadline, committed_at, closed_at, plan_no, unit_no, created_at)
+                VALUES (?, ?, ?, ?, 'PREOCCUPIED', ?, NULL, NULL, ?, ?, ?)
                 """, orderNo, playerId, recipeId, versionId,
-                Timestamp.from(deadline), Timestamp.from(now));
+                Timestamp.from(deadline), planNo, unitNo, Timestamp.from(now));
         return jdbc.queryForObject("SELECT id FROM craft_order WHERE order_no = ?", Long.class, orderNo);
     }
 

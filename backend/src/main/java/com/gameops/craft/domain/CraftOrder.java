@@ -17,5 +17,7 @@ public record CraftOrder(
         Instant committedAt,
         Instant closedAt,
         String revokeRefNo,
+        String planNo,
+        Integer unitNo,
         Instant createdAt
 ) {}

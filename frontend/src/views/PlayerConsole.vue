@@ -2,7 +2,9 @@
   <div>
     <div v-if="flash" class="flash" :class="flash.type">{{ flash.text }}</div>
 
-    <div class="grid2">
+    <BatchPlanPanel :recipes="recipes" @changed="refreshAll" ref="planPanel" />
+
+    <div class="grid2" style="margin-top:16px">
       <!-- Left: recipes & craft -->
       <div>
         <div class="panel">
@@ -161,6 +163,7 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { api, idemKey } from '../api'
 import Countdown from '../components/Countdown.vue'
 import EntryType from '../components/EntryType.vue'
+import BatchPlanPanel from '../components/BatchPlanPanel.vue'
 
 const recipes = ref([])
 const inventory = reactive({ items: [], activeHolds: [] })
@@ -170,6 +173,7 @@ const selectedOrderNo = ref('')
 const detail = ref(null)
 const busy = ref(false)
 const flash = ref(null)
+const planPanel = ref(null)
 let timer
 
 function notify(type, text) {
@@ -190,6 +194,7 @@ async function refreshAll() {
     crafts.value = myCrafts
     ledger.value = myLedger
     if (selectedOrderNo.value) await loadDetail()
+    if (planPanel.value) await planPanel.value.reload()
   } catch (e) {
     notify('error', '刷新失败：' + e.message)
   }

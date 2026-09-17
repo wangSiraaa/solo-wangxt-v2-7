@@ -167,6 +167,62 @@ FINAL=$(jget "$P1" /api/player/inventory)
 check "$(echo "$FINAL" | jq -r '[.items[]|select(.itemCode|startswith("MAT_"))|.qty] | add // 0')" "0" "材料总量恰好扣一份，无多扣"
 rm -rf $TMP
 
+echo "== 12. 批量合成计划：同键并发只生一个、worker 执行、对账一致、取消只跳未开始 =="
+# player3 恰好 3 份烈焰之剑材料（其余在前面步骤已变动，重置为 3 份）
+for it in 'MAT_IRON 9' 'MAT_MAGIC_CORE 6' 'MAT_FIRE_SHARD 3'; do
+  set -- $it
+  jpost "$OPS" /api/operator/inventory/grant "{\"playerId\":$P3_ID,\"itemCode\":\"$1\",\"qty\":$2}" >/dev/null
+done
+PLANKEY=$(uuid)
+TMP2=$(mktemp -d)
+# 16 个并发同键创建 -> 只能有一个计划
+for i in $(seq 1 16); do
+  ( curl -s -X POST $BASE/api/player/plans -H "X-Auth-Token: $P3" \
+      -H 'Content-Type: application/json' -H "Idempotency-Key: $PLANKEY" \
+      -d '{"recipeId":1,"count":3}' > $TMP2/p$i ) &
+done
+wait
+PLAN_NOS=$(jq -r .planNo $TMP2/p* | sort -u | wc -l | tr -d ' ')
+check "$PLAN_NOS" "1" "16 个同键并发只创建一个批量计划"
+PLAN=$(jq -c '.' $TMP2/p1)
+PLANNO=$(echo "$PLAN" | jq -r .planNo)
+check "$(echo "$PLAN" | jq -r .boundVersionNo)" "2" "计划绑定当前已发布版本"
+# worker（1s 轮询）把 3 个序号全部跑完
+for i in $(seq 1 30); do
+  ST=$(jget "$P3" /api/player/plans/$PLANNO | jq -r .status)
+  [ "$ST" = "COMPLETED" ] && break
+  sleep 1
+done
+check "$ST" "COMPLETED" "worker 将计划执行至 COMPLETED"
+PD=$(jget "$P3" /api/player/plans/$PLANNO)
+DONE=$(echo "$PD" | jq '[.units[]|select(.status=="DONE")]|length')
+check "$DONE" "3" "3 个序号全部 DONE"
+echo "$PD" | jq -e '[.units[].orderNo] | all(. != null) and (length == (unique|length))' >/dev/null \
+  && ok "每序号关联唯一合成单号" || bad "序号单号异常"
+SWORD=$(invq "$(jget "$P3" /api/player/inventory)" EQP_FIRE_SWORD)
+check "$SWORD" "3" "3 份产出全部发放"
+# 对账一致
+RC=$(jget "$OPS" /api/operator/plans/$PLANNO/reconcile)
+check "$(echo "$RC" | jq -r .consistent)" "true" "运营对账：计划/合成单/流水一致"
+# 同键再创建回放
+AGAINP=$(jpost "$P3" /api/player/plans '{"recipeId":1,"count":3}' "$PLANKEY")
+check "$(echo "$AGAINP" | jq -r .planNo)" "$PLANNO" "计划创建同键回放同号"
+check "$(echo "$AGAINP" | jq -r .replayed)" "true" "回放标记 replayed=true"
+# 超出 100 次被服务端拒绝
+RANGE=$(curl -s -o /dev/null -w '%{http_code}' -X POST $BASE/api/player/plans \
+  -H "X-Auth-Token: $P3" -H 'Content-Type: application/json' -H "Idempotency-Key: $(uuid)" \
+  -d '{"recipeId":1,"count":101}')
+check "$RANGE" "400" "101 次被服务端拒绝（非前端限制）"
+# 取消一个新计划：尚未开始序号全部 SKIPPED，状态 CANCELLED
+CPLAN=$(jpost "$P3" /api/player/plans '{"recipeId":1,"count":2}' "$(uuid)")
+CPNO=$(echo "$CPLAN" | jq -r .planNo)
+jpost "$P3" /api/player/plans/cancel "{\"planNo\":\"$CPNO\",\"reason\":\"smoke cancel plan\"}" >/dev/null
+sleep 2
+CCD=$(jget "$P3" /api/player/plans/$CPNO)
+echo "$CCD" | jq -e '.status=="CANCELLED" and ([.units[]|select(.status=="SKIPPED")]|length)==2' >/dev/null \
+  && ok "取消仅跳过未开始序号，计划 CANCELLED" || bad "取消结果异常: $(echo "$CCD" | jq -c '{status,units:[.units[].status]}')"
+rm -rf $TMP2
+
 echo
 echo "结果：PASS=$PASS FAIL=$FAIL"
 [ $FAIL -eq 0 ]

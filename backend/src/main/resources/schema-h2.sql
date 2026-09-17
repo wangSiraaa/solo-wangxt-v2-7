@@ -71,12 +71,15 @@ CREATE TABLE IF NOT EXISTS craft_order (
     committed_at        TIMESTAMP(3) NULL,
     closed_at           TIMESTAMP(3) NULL,
     revoke_ref_no       CHAR(20)     NULL,
+    plan_no             CHAR(20)     NULL,
+    unit_no             INT          NULL,
     created_at          TIMESTAMP(3) NOT NULL,
     PRIMARY KEY (id),
     CONSTRAINT uk_order_no UNIQUE (order_no)
 );
 CREATE INDEX IF NOT EXISTS ix_order_player ON craft_order(player_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_order_status_deadline ON craft_order(status, preoccupy_deadline);
+CREATE INDEX IF NOT EXISTS ix_order_plan ON craft_order(plan_no, unit_no);
 
 CREATE TABLE IF NOT EXISTS material_hold (
     id           BIGINT      NOT NULL AUTO_INCREMENT,
@@ -100,6 +103,8 @@ CREATE TABLE IF NOT EXISTS ledger_entry (
     entry_type    VARCHAR(24)  NOT NULL,
     qty_delta     BIGINT      NOT NULL,
     related_ref   CHAR(20)     NULL,
+    plan_no       CHAR(20)     NULL,
+    unit_no       INT          NULL,
     status        VARCHAR(16)  NOT NULL DEFAULT 'POSTED',
     remark        VARCHAR(255) NULL,
     created_at    TIMESTAMP(3) NOT NULL,
@@ -108,6 +113,7 @@ CREATE TABLE IF NOT EXISTS ledger_entry (
 );
 CREATE INDEX IF NOT EXISTS ix_ledger_player ON ledger_entry(player_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_ledger_related ON ledger_entry(related_ref);
+CREATE INDEX IF NOT EXISTS ix_ledger_plan ON ledger_entry(plan_no, unit_no);
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     idempotency_key VARCHAR(80)  NOT NULL,
@@ -137,3 +143,71 @@ CREATE TABLE IF NOT EXISTS revoke_record (
     CONSTRAINT uk_revoke_no UNIQUE (revoke_no)
 );
 CREATE INDEX IF NOT EXISTS ix_revoke_result ON revoke_record(result);
+
+-- Batch craft plans (see schema-mysql.sql for column documentation).
+CREATE TABLE IF NOT EXISTS craft_plan (
+    id                 BIGINT       NOT NULL AUTO_INCREMENT,
+    plan_no            CHAR(20)     NOT NULL,
+    player_id          BIGINT       NOT NULL,
+    recipe_id          BIGINT       NOT NULL,
+    recipe_version_id  BIGINT       NOT NULL,
+    total_count        INT          NOT NULL,
+    status             VARCHAR(16)  NOT NULL,
+    stop_flag          TINYINT      NOT NULL DEFAULT 0,
+    stop_reason        VARCHAR(255) NULL,
+    completed_count    INT          NOT NULL DEFAULT 0,
+    skipped_count      INT          NOT NULL DEFAULT 0,
+    failed_count       INT          NOT NULL DEFAULT 0,
+    inputs_json        CLOB         NOT NULL,
+    outputs_json       CLOB         NOT NULL,
+    cancelled_at       TIMESTAMP(3) NULL,
+    finished_at        TIMESTAMP(3) NULL,
+    created_at         TIMESTAMP(3) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_plan_no UNIQUE (plan_no)
+);
+CREATE INDEX IF NOT EXISTS ix_plan_player ON craft_plan(player_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_plan_status ON craft_plan(status);
+
+CREATE TABLE IF NOT EXISTS craft_plan_unit (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    plan_id          BIGINT       NOT NULL,
+    plan_no          CHAR(20)     NOT NULL,
+    unit_no          INT          NOT NULL,
+    status           VARCHAR(16)  NOT NULL,
+    lease_owner      VARCHAR(64)  NULL,
+    lease_token      CHAR(36)     NULL,
+    leased_at        TIMESTAMP(3) NULL,
+    lease_expires_at TIMESTAMP(3) NULL,
+    attempts         INT          NOT NULL DEFAULT 0,
+    order_no         CHAR(20)     NULL,
+    consumed_at      TIMESTAMP(3) NULL,
+    rewarded_at      TIMESTAMP(3) NULL,
+    finished_at      TIMESTAMP(3) NULL,
+    skip_reason      VARCHAR(255) NULL,
+    fail_reason      VARCHAR(255) NULL,
+    created_at       TIMESTAMP(3) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_plan_unit_no UNIQUE (plan_id, unit_no),
+    CONSTRAINT uk_unit_order UNIQUE (order_no)
+);
+CREATE INDEX IF NOT EXISTS ix_unit_claim ON craft_plan_unit(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS ix_unit_plan ON craft_plan_unit(plan_id, status);
+
+CREATE TABLE IF NOT EXISTS craft_plan_repair (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    repair_key       VARCHAR(80)  NOT NULL,
+    plan_no          CHAR(20)     NOT NULL,
+    unit_no          INT          NULL,
+    diff_type        VARCHAR(32)  NOT NULL,
+    item_code        VARCHAR(64)  NOT NULL,
+    qty_delta        BIGINT       NOT NULL,
+    comp_ref_no      CHAR(20)     NOT NULL,
+    operator_id      BIGINT       NOT NULL,
+    remark           VARCHAR(255) NULL,
+    created_at       TIMESTAMP(3) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_repair_key UNIQUE (repair_key),
+    CONSTRAINT uk_repair_ledger_ref UNIQUE (comp_ref_no)
+);
+CREATE INDEX IF NOT EXISTS ix_repair_plan ON craft_plan_repair(plan_no, unit_no);

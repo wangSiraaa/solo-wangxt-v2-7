@@ -78,6 +78,23 @@ export const api = {
   cancel: (orderNo, reason) =>
     request('POST', '/api/player/crafts/cancel', { orderNo, reason }),
 
+  // ---- player batch plans ----
+  myPlans: () => request('GET', '/api/player/plans'),
+  planDetail: (no) => request('GET', `/api/player/plans/${no}`),
+  createPlan: (recipeId, count, key) =>
+    request('POST', '/api/player/plans', { recipeId, count }, { 'Idempotency-Key': key }),
+  cancelPlan: (planNo, reason) =>
+    request('POST', '/api/player/plans/cancel', { planNo, reason }),
+
+  // ---- operator batch plans / reconciliation / repair ----
+  opPlans: (view = 'all') => request('GET', `/api/operator/plans?view=${view}`),
+  opPlanDetail: (no) => request('GET', `/api/operator/plans/${no}`),
+  opReconcile: (no) => request('GET', `/api/operator/plans/${no}/reconcile`),
+  opRepairs: (planNo) =>
+    request('GET', '/api/operator/repairs' + (planNo ? `?planNo=${encodeURIComponent(planNo)}` : '')),
+  opRepair: (body, key) =>
+    request('POST', '/api/operator/plans/repair', body, { 'Idempotency-Key': key }),
+
   // ---- operator ----
   opRecipes: () => request('GET', '/api/operator/recipes'),
   createRecipe: (code, name) => request('POST', '/api/operator/recipes', { code, name }),

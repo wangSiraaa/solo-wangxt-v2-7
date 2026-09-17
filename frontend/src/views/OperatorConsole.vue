@@ -5,6 +5,7 @@
     <div class="tabs" style="margin-bottom:14px">
       <button :class="tab==='recipes' ? '' : 'secondary'" @click="tab='recipes'">配方版本</button>
       <button :class="tab==='ledger' ? '' : 'secondary'" @click="tab='ledger'; loadOpsData()">账本监控</button>
+      <button :class="tab==='plans' ? '' : 'secondary'" @click="tab='plans'; loadPlans()">批量计划/对账</button>
       <button :class="tab==='revoke' ? '' : 'secondary'" @click="tab='revoke'; loadRevokes()">撤销与异常清单</button>
       <button :class="tab==='grant' ? '' : 'secondary'" @click="tab='grant'">库存工具</button>
     </div>
@@ -131,9 +132,126 @@
       </div>
     </div>
 
+    <!-- ===================== 批量计划 / 对账 / 补偿 ===================== -->
+    <div v-if="tab==='plans'">
+      <div class="panel">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">批量合成计划</h2>
+          <div class="row">
+            <label class="small muted">
+              <input type="checkbox" v-model="showAnomalies" @change="loadPlans" /> 仅异常/非 COMPLETED
+            </label>
+            <button class="secondary" @click="loadPlans">刷新</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr>
+            <th>计划号</th><th>玩家</th><th>配方/版本</th><th>总数</th>
+            <th class="right">完成</th><th class="right">跳过</th><th class="right">失败</th>
+            <th>状态</th><th>停止原因</th><th>创建时间</th><th></th>
+          </tr></thead>
+          <tbody>
+          <tr v-for="p in planList" :key="p.planNo">
+            <td class="mono small">{{ p.planNo }}</td>
+            <td>#{{ p.playerId }}</td>
+            <td>{{ p.recipeName }} v{{ p.boundVersionNo }}</td>
+            <td>{{ p.totalCount }}</td>
+            <td class="right">{{ p.completedCount }}</td>
+            <td class="right">{{ p.skippedCount }}</td>
+            <td class="right">{{ p.failedCount }}</td>
+            <td><span class="tag" :class="planClass(p.status)">{{ p.status }}</span></td>
+            <td class="small muted">{{ p.stopReason || '' }}</td>
+            <td class="small muted">{{ fmt(p.createdAt) }}</td>
+            <td class="right">
+              <button class="secondary" @click="openPlan(p.planNo)">对账/明细</button>
+            </td>
+          </tr>
+          <tr v-if="!planList.length"><td colspan="11" class="muted">暂无计划</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-if="recon" class="panel">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">对账：{{ recon.planNo }}
+            <span class="tag" :class="planClass(recon.status)" style="margin-left:8px">{{ recon.status }}</span>
+            <span class="tag" :class="recon.consistent ? 'ok' : 'bad'" style="margin-left:8px">
+              {{ recon.consistent ? '账实一致' : '存在差异' }}
+            </span>
+          </h2>
+          <div class="row">
+            <button class="secondary" @click="openPlan(recon.planNo)">重新对账</button>
+            <button class="ghost" @click="recon=null">关闭</button>
+          </div>
+        </div>
+        <p class="muted small">
+          完成 {{ recon.completedCount }} / 跳过 {{ recon.skippedCount }} / 失败 {{ recon.failedCount }}
+          / 未完成 {{ recon.notStartedCount }}。修复只能<b>追加</b>补偿流水，历史流水不改写、不删除；
+          同一修复请求用同一 Idempotency-Key 可安全重试。
+        </p>
+
+        <h3>对账差异</h3>
+        <table>
+          <thead><tr><th>序号</th><th>类型</th><th>级别</th><th>道具</th><th class="right">应有</th><th class="right">实有</th><th>说明</th><th></th></tr></thead>
+          <tbody>
+          <tr v-for="(d, i) in recon.diffs" :key="i">
+            <td>{{ d.unitNo || '—' }}</td>
+            <td class="mono small">{{ d.type }}</td>
+            <td><span class="tag" :class="d.severity === 'ERROR' ? 'bad' : 'warn'">{{ d.severity }}</span></td>
+            <td class="mono">{{ d.itemCode || '' }}</td>
+            <td class="right">{{ d.expected ?? '' }}</td>
+            <td class="right">{{ d.actual ?? '' }}</td>
+            <td class="small muted">{{ d.detail }}</td>
+            <td class="right">
+              <button v-if="canRepair(d)" class="secondary" @click="quickRepair(d)">追加补偿</button>
+            </td>
+          </tr>
+          <tr v-if="!recon.diffs.length"><td colspan="8" class="muted">未发现差异。</td></tr>
+          </tbody>
+        </table>
+
+        <h3>逐序号时间线</h3>
+        <table>
+          <thead><tr><th>#</th><th>状态</th><th>合成单号</th><th>扣料</th><th>发奖</th><th>回写</th><th>租约owner</th></tr></thead>
+          <tbody>
+          <tr v-for="u in recon.units" :key="u.unitNo">
+            <td>{{ u.unitNo }}</td>
+            <td><span class="tag" :class="unitClass(u.status)">{{ u.status }}</span></td>
+            <td class="mono small">{{ u.orderNo || '—' }}</td>
+            <td class="small muted">{{ fmt(u.consumedAt) }}</td>
+            <td class="small muted">{{ fmt(u.rewardedAt) }}</td>
+            <td class="small muted">{{ fmt(u.finishedAt) }}</td>
+            <td class="small muted">{{ u.leaseOwner || '' }}</td>
+          </tr>
+          </tbody>
+        </table>
+
+        <h3>补偿结果</h3>
+        <table>
+          <thead><tr><th>修复键</th><th>序号</th><th>差异</th><th>道具</th><th class="right">补偿变动</th><th>补偿流水</th><th>运营</th><th>时间</th></tr></thead>
+          <tbody>
+          <tr v-for="r in repairList" :key="r.repairKey">
+            <td class="mono small">{{ r.repairKey.slice(0,12) }}…</td>
+            <td>{{ r.unitNo ?? '—' }}</td>
+            <td class="mono small">{{ r.diffType }}</td>
+            <td class="mono">{{ r.itemCode }}</td>
+            <td class="right" :class="r.qtyDelta >= 0 ? 'delta-pos' : 'delta-neg'">{{ r.qtyDelta }}</td>
+            <td class="mono small">{{ r.compRefNo }}</td>
+            <td>#{{ r.operatorId }}</td>
+            <td class="small muted">{{ fmt(r.createdAt) }}</td>
+          </tr>
+          <tr v-if="!repairList.length"><td colspan="8" class="muted">该计划暂无补偿。</td></tr>
+          </tbody>
+        </table>
+
+        <div v-if="repairFlash" class="flash" :class="repairFlash.type" style="margin-top:10px">
+          {{ repairFlash.text }}
+        </div>
+      </div>
+    </div>
+
     <!-- ===================== 撤销与异常 ===================== -->
-    <div v-if="tab==='revoke'">
-      <div class="grid2">
+    <div v-if="tab==='revoke'">      <div class="grid2">
         <div class="panel">
           <h2>撤销错误奖励</h2>
           <p class="muted small">
@@ -271,6 +389,13 @@ const exceptions = ref([])
 const revokesAll = ref([])
 const flash = ref(null)
 
+// batch plans / reconciliation
+const planList = ref([])
+const showAnomalies = ref(false)
+const recon = ref(null)
+const repairList = ref([])
+const repairFlash = ref(null)
+
 const newCode = ref('')
 const newName = ref('')
 const grantPlayerId = ref(2)
@@ -378,6 +503,57 @@ async function doGrant() {
 function versionClass(s) { return { PUBLISHED: 'ok', DRAFT: 'info', ARCHIVED: 'warn' }[s] || '' }
 function versionText(s) { return { PUBLISHED: '已发布', DRAFT: '草稿', ARCHIVED: '已归档' }[s] || s }
 function orderClass(s) { return { COMMITTED: 'ok', PREOCCUPIED: 'info', CANCELLED: 'warn', TIMEOUT: 'warn', REVOKED: 'bad' }[s] || '' }
+
+// ---- batch plans / reconciliation / repair ----
+function planClass(s) {
+  return { COMPLETED: 'ok', RUNNING: 'info', PARTIAL: 'warn', CANCELLED: 'warn', FAILED: 'bad' }[s] || ''
+}
+function unitClass(s) {
+  return { DONE: 'ok', PENDING: 'info', LEASED: 'info', SKIPPED: 'warn', FAILED: 'bad' }[s] || ''
+}
+
+async function loadPlans() {
+  planList.value = await api.opPlans(showAnomalies.value ? 'anomalies' : 'all')
+}
+
+async function openPlan(planNo) {
+  recon.value = await api.opReconcile(planNo)
+  repairList.value = await api.opRepairs(planNo)
+}
+
+/** Only missing/extra balance discrepancies are append-only repairable. */
+function canRepair(d) {
+  return ['PRODUCE_MISSING', 'CONSUME_MISSING', 'PRODUCE_EXTRA'].includes(d.type) && !!d.itemCode
+}
+
+function repairDelta(d) {
+  if (d.type === 'PRODUCE_MISSING') return (d.expected || 0) - (d.actual || 0)
+  if (d.type === 'CONSUME_MISSING') return -((d.expected || 0) - (d.actual || 0))
+  if (d.type === 'PRODUCE_EXTRA') return -((d.actual || 0) - (d.expected || 0))
+  return 0
+}
+
+async function quickRepair(d) {
+  const delta = repairDelta(d)
+  if (!delta) { notify('error', '该差异数量为 0，无需补偿'); return }
+  const msg = `确认对 ${d.itemCode} 追加一笔 ${delta > 0 ? '+' : ''}${delta} 的补偿流水？\n` +
+    `历史流水不会被改写或删除。同一修复请求键可安全重试。`
+  if (!confirm(msg)) return
+  try {
+    // Deterministic key per (plan, unit, type, item): clicking "补偿" repeatedly
+    // for the SAME discrepancy replays the original and never double-posts.
+    // After a successful repair the diff disappears (reconcile counts COMPENSATE).
+    const key = 'fix-' + d.planNo + '-' + (d.unitNo || 0) + '-' + d.type + '-' + d.itemCode
+    const r = await api.opRepair({
+      planNo: d.planNo, unitNo: d.unitNo || null, diffType: d.type,
+      itemCode: d.itemCode, qty: delta, remark: '运营台一键补偿'
+    }, key)
+    repairFlash.value = { type: 'ok', text: `已追加补偿流水 ${r.compRefNo}（${r.replayed ? '回放，未重复发' : '新增'}）` }
+    await openPlan(d.planNo)
+  } catch (e) {
+    repairFlash.value = { type: 'error', text: `补偿失败 [${e.code}]：${e.message}` }
+  }
+}
 
 onMounted(loadRecipes)
 </script>

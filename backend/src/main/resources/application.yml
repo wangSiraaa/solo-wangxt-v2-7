@@ -29,3 +29,13 @@ app:
   # Idempotency records left IN_FLIGHT longer than this (process crash) are ignored.
   in-flight-ttl-seconds: 300
   token-ttl-hours: 12
+  plan:
+    # Batch-plan worker: DB-leased; any number of instances may run concurrently.
+    worker:
+      enabled: true
+      delay-ms: 1000
+      max-plans-per-tick: 20
+    # Unit lease lifetime. A crashed worker's unit becomes reclaimable after this.
+    lease-seconds: 30
+    # A LEASED unit older than expiry + this grace is surfaced as STUCK_LEASE.
+    stuck-lease-seconds: 300

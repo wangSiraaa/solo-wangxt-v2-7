@@ -52,10 +52,12 @@ java -jar backend/target/craft-service-1.0.0.jar --spring.profiles.active=mysql
 ### 跑测试
 
 ```bash
-# 默认：H2 上 14 个用例（含“最后一份材料 2/8 并发”“提交与超时竞争”“幂等重试”等）
+# 默认：H2 上 35 个用例（含“最后一份材料并发”“同键 32 并发只建一个计划”
+# “两个 worker 抢同一序号”“两个崩溃窗口租约恢复”“取消/领取竞争”
+# “执行中发新版本/活动结束”“最后材料 PARTIAL”“对账补偿幂等重试”等）
 cd backend && mvn test
 
-# 真实 InnoDB（需要本地 Docker，Testcontainers）：
+# 真实 InnoDB（需要本地 Docker，Testcontainers；含批量计划 MySQL IT）：
 mvn test -Pmysql-it
 ```
 
@@ -93,8 +95,62 @@ bash scripts/smoke-e2e.sh
 
 - `CONSUME`（预占扣减，负）、`PRODUCE`（完成产出，正）、`RELEASE`（取消/超时回补，正）
 - `GRANT`（运营设置）、`REVOKE`（撤销冲销，负）、`REVOKE_PENDING`（撤销挂账，负，status=PENDING）
+- `COMPENSATE`（批量计划对账补偿，带符号；只追加、不改写历史，Idempotency-Key 幂等）
+
+批量计划的每条流水与其普通合成单都带 `plan_no/unit_no` 追溯字段；前端“逐笔材料去向”与
+计划“逐序号时间线”即据此聚合。
 
 前端“逐笔材料去向”即按单号聚合这些流水（含时间、类型、关联单号、说明）。
+
+---
+
+## 2.5 批量合成计划（1–100 次，DB 租约 worker）
+
+玩家一次提交 1–100 次合成，服务端创建**一个计划**并冻结配方版本与每次材料/产出快照；
+后台 worker 从 MySQL **领取子任务逐次执行**，而不是前端循环调用单次合成。
+
+- 计划头 `craft_plan`：冻结 `recipe_version_id / inputs_json / outputs_json`、总数、
+  状态机 `RUNNING → COMPLETED / PARTIAL / CANCELLED / FAILED`、`stop_flag`、完成/跳过/失败计数。
+- 子任务 `craft_plan_unit`：每序号一行，状态 `PENDING / LEASED / DONE / SKIPPED / FAILED`，
+  带 `lease_owner / lease_token / lease_expires_at` 数据库租约，并 1:1 关联普通合成单号 `order_no`。
+- 每个子任务的扣料/发奖就是原有合成单与账本流水：`craft_order.plan_no/unit_no`、
+  `ledger_entry.plan_no/unit_no` 携带可追溯标识（单号前缀 `PU…`，计划号 `BP…`）。
+
+| 难点 | 机制 |
+|------|------|
+| 同键并发只能有一个计划 | 创建仍走 `Idempotency-Key` 唯一键 INSERT 占位；同键 32 并发只有一个事务插入计划，其余等待赢家后**回放**同一计划（不创建第二个、不循环单次合成）。 |
+| worker 可并行、序号至多一次 | 领取在一个事务内：统一锁顺序 **plan 行 → unit 行**；`PENDING→LEASED` 是带计划门控子查询的 **CAS UPDATE**，`EXISTS(... status='RUNNING' AND stop_flag=0)`。两个 worker 抢同一序号，行锁串行 + CAS 只有一行变更。 |
+| 已扣料未发奖崩溃 | `deduct / reward / writeback` 是**三个独立短事务**。扣料即普通合成单 `PREOCCUPIED` + `WHERE qty>=need` 条件扣减 + CONSUME。崩溃后租约过期，其他 worker 回收（`LEASED 且 lease_expires_at<=now` 的 CAS），读到订单已存在则**不再扣料**，只补发奖。 |
+| 已发奖未回写状态崩溃 | 发奖事务内做合成单 `PREOCCUPIED→COMMITTED` CAS + PRODUCE 唯一键 + `unit.rewarded_at`；回写 `LEASED→DONE` 还要带 `lease_token`。恢复时订单已 COMMITTED 则**只回写、不再发奖**；旧 worker 的僵尸回写因 token 不匹配返回 0 行。 |
+| 活动结束/材料不足 | 新序号启动门控（claim 内）校验：配方 ACTIVE、冻结版本活动窗口仍开放。门控关闭 → `stop_flag=1` 并把 PENDING 全部 SKIPPED；扣料时材料不足（条件 UPDATE 0 行）→ 该事务回滚（未扣任何料），本序号 SKIPPED 且计划停止。**已 LEASED/已扣料的序号不受影响，仍按绑定版本完成**。 |
+| 玩家取消与领取竞争 | 取消与领取都先锁 plan 行（统一锁序，无死锁）。取消只置 `stop_flag + cancelled_at`，PENDING 立即 SKIPPED；LEASED 序号继续完成且奖励不回滚，最后一笔完成触发 finalize 落 `CANCELLED`，完成数准确。 |
+| 最终状态明确 | finalize 在 plan 行锁下重算计数（无 LEASED 残留才终结，停止时清扫剩余 PENDING）：全部 DONE=`COMPLETED`；有完成有未执行=`PARTIAL`；取消=`CANCELLED`；0 完成且有 FAILED=`FAILED`。计数与状态由 CAS 从 RUNNING 落终态，并发 worker 至多终结一次。 |
+| 版本发布 | 计划创建时即固化版本；执行途中发布新版本、甚至旧版本已 ARCHIVED，计划序号始终用冻结版本结算（与单次合成同一条“在途按旧版本”原则一致）。 |
+| 不靠 JVM 锁/单进程 | 正确性全部在 InnoDB 行锁、条件更新、CAS、唯一约束；`PlanWorker` 可多实例/多进程部署，崩溃只留下 DB 租约，过期即可被任意实例恢复。 |
+
+### 对账与运营修复（只追加补偿流水）
+
+- `GET /api/operator/plans/{planNo}/reconcile`：只读比对 **计划序号状态 ↔ 合成单状态 ↔ 账本流水**，
+  报告 `PRODUCE_MISSING / CONSUME_MISSING / PRODUCE_EXTRA / ORDER_MISSING /
+  ORDER_STATUS_MISMATCH / STUCK_LEASE / PLAN_STATUS_MISMATCH` 差异。
+- `POST /api/operator/plans/repair`：修复**只能新增一笔带符号 `COMPENSATE` 流水**
+  （补发产出为正、补扣材料为负），同步原子改背包；**绝不更新或删除历史流水**。
+  请求必带 `Idempotency-Key`，落 `craft_plan_repair` 唯一键——同一修复请求重试只回放、不产生第二笔补偿；
+  负向补偿余额不足返回 409 且一笔不发。修复后再对账，COMPENSATE 计入已修复侧即恢复一致。
+- 新增流水类型 `COMPENSATE`；`craft_plan_repair.comp_ref_no` 与补偿流水 1:1。
+
+### 批量计划接口
+
+玩家（`/api/player`，PLAYER）
+- `POST /plans` `{recipeId,count}`（必带 Idempotency-Key）、`POST /plans/cancel` `{planNo,reason}`
+- `GET /plans`、`GET /plans/{planNo}`（含每个序号的状态/订单号/扣料·发奖·回写时间线）
+
+运营（`/api/operator`，OPERATOR）
+- `GET /plans?view=anomalies`、`GET /plans/{planNo}`
+- `GET /plans/{planNo}/reconcile`、`POST /plans/repair`（Idempotency-Key）、`GET /repairs?planNo=`
+
+配置：`app.plan.worker.enabled/delay-ms/max-plans-per-tick`、`app.plan.lease-seconds`（默认 30s）、
+`app.plan.stuck-lease-seconds`。保留全部单次合成、版本发布、超时释放、奖励撤销能力不变。
 
 ---
 
@@ -109,18 +165,23 @@ bash scripts/smoke-e2e.sh
 - `POST /crafts/cancel` `{orderNo,reason}`
 - `GET  /crafts`、`GET /crafts/{orderNo}`（含 holds + 全量流水）
 - `GET  /inventory`、`GET /ledger`
+- `POST /plans` `{recipeId,count}`（批量计划，必带 Idempotency-Key）
+- `POST /plans/cancel` `{planNo,reason}`、`GET /plans`、`GET /plans/{planNo}`
 
 运营（`/api/operator/**`，仅 OPERATOR）
 - `GET/POST /recipes`、`POST /recipes/new-version`、`POST /recipes/draft`、`POST /recipes/publish`、`POST /recipes/close`
 - `GET  /crafts`、`GET  /ledger?refNo=`
 - `POST /revokes` `{orderNo}`、`GET /revokes`、`GET /exceptions`
 - `POST /inventory/grant`（测试/补库存，附 GRANT 审计流水）
+- `GET  /plans?view=anomalies`、`GET /plans/{planNo}`、`GET /plans/{planNo}/reconcile`
+- `POST /plans/repair`（仅追加 COMPENSATE 补偿，Idempotency-Key 幂等）、`GET /repairs?planNo=`
 
 公共：`POST /api/auth/login` `{username,password}`
 
 错误形如 `{"error":"MATERIAL_INSUFFICIENT","message":"材料不足：MAT_IRON 需要 3"}`，常见码：
 `RECIPE_CLOSED` / `ACTIVITY_NOT_OPEN` / `RECIPE_NOT_PUBLISHED` / `MATERIAL_INSUFFICIENT` /
-`PREOCCUPY_EXPIRED` / `ORDER_COMMIT_RACE` / `RETRY_IN_FLIGHT` / `ORDER_NOT_REVOKABLE`。
+`PREOCCUPY_EXPIRED` / `ORDER_COMMIT_RACE` / `RETRY_IN_FLIGHT` / `ORDER_NOT_REVOKABLE` /
+`PLAN_COUNT_OUT_OF_RANGE` / `LEASE_LOST` / `COMPENSATE_INSUFFICIENT_BALANCE` / `REPAIR_DUPLICATE`。
 
 ---
 
@@ -136,8 +197,8 @@ npm run build      # 产物 dist/
 发布到后端单端口：把 `dist/*` 拷到 `backend/src/main/resources/static/`（已内置一份）。
 
 操作台包含：
-- 玩家：配方版本与**合成预览**（每行材料的需要/持有/其他单占用/缺口）、预占倒计时、背包、**按合成单逐笔材料去向**、最近流水。
-- 运营：配方多版本管理（草稿/发布/归档，已发布只读）、账本监控（按单号查流水）、撤销与**异常清单**、库存工具。
+- 玩家：**批量合成计划**（创建/取消、实时进度条、逐序号扣料·发奖·回写时间线）、配方版本与**合成预览**（每行材料的需要/持有/其他单占用/缺口）、预占倒计时、背包、**按合成单逐笔材料去向**、最近流水。
+- 运营：**批量计划/对账**（异常计划筛选、计划状态×合成单×流水差异、逐序号时间线、一键追加 COMPENSATE 补偿且幂等、补偿结果）、配方多版本管理（草稿/发布/归档，已发布只读）、账本监控（按单号查流水）、撤销与**异常清单**、库存工具。
 
 ---
 
@@ -153,9 +214,13 @@ backend/
     common/      时钟、错误码、单号生成、JSON
     domain/      值对象
     repo/        JdbcTemplate 仓储（FOR UPDATE / 条件更新 / CAS）
-    service/     CraftTxService(事务核心) CraftService(幂等外观) RecipeAdminService TimeoutSweeper …
+    service/     CraftTxService(单次事务核心) CraftService(幂等外观)
+                 PlanService + PlanUnitTxService(批量计划：创建/取消/DB租约领取/崩溃恢复/终结)
+                 PlanWorker(多实例后台worker) PlanReconcileService(对账+只追加补偿)
+                 RecipeAdminService TimeoutSweeper
     web/         控制器、鉴权拦截器、全局异常
-  src/test/      H2 并发/版本/超时/撤销/HTTP 全流程 + MySQL Testcontainers IT
+  src/test/      H2 并发/版本/超时/撤销/批量计划(32同键并发/双worker/两崩溃窗口/取消竞争/
+                 新版本/活动结束/最后材料PARTIAL/对账补偿重试)/HTTP 全流程 + MySQL Testcontainers IT
 frontend/        Vue 3 操作台源码
 deploy/          docker-compose（MySQL）
 scripts/smoke-e2e.sh
