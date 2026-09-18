@@ -58,4 +58,16 @@ public class HoldRepository {
                 """, (rs, n) -> new HoldRow(rs.getLong("id"), rs.getLong("order_id"), rs.getLong("player_id"),
                 rs.getString("item_code"), rs.getLong("qty")), playerId);
     }
+
+    /**
+     * Batch-plan variant: consumed material is recorded as a hold as well, but the hold is
+     * settled (marked released) inside the SAME deduction transaction — it never goes back to
+     * the balance (no RELEASE); it is the audit anchor tying plan unit -> consumed materials.
+     */
+    public void createAndSettle(long orderId, long playerId, String itemCode, long qty, Instant now) {
+        jdbc.update("""
+                INSERT INTO material_hold (order_id, player_id, item_code, qty, released, created_at, released_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?)
+                """, orderId, playerId, itemCode, qty, Timestamp.from(now), Timestamp.from(now));
+    }
 }

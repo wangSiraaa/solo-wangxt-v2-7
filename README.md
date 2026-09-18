@@ -52,14 +52,16 @@ java -jar backend/target/craft-service-1.0.0.jar --spring.profiles.active=mysql
 ### 跑测试
 
 ```bash
-# 默认：H2 上 14 个用例（含“最后一份材料 2/8 并发”“提交与超时竞争”“幂等重试”等）
+# 默认：H2 上 32 个用例（含“批量计划 32 同键并发”“两 worker 抢同一序号”
+# “已扣未发/已发未回写 两崩溃窗口租约恢复”“取消与领取竞争”“执行中发新版本”
+# “最后一份材料部分完成”“对账补偿重试不产生第二笔”等）
 cd backend && mvn test
 
 # 真实 InnoDB（需要本地 Docker，Testcontainers）：
 mvn test -Pmysql-it
 ```
 
-### 端到端冒烟（35 项断言，建议对“全新启动的 H2”跑）
+### 端到端冒烟（52 项断言，建议对“全新启动的 H2”跑）
 
 ```bash
 bash scripts/smoke-e2e.sh
@@ -67,7 +69,9 @@ bash scripts/smoke-e2e.sh
 
 覆盖：登录鉴权 → 预览 → 预占/同键重试 → 完成/重复提交 → 取消退回 → **10s 超时自动释放** →
 **新版本发布后在途单按旧版本完成** → 下架后强制提交被服务端拒绝 →
-**撤销全额反向流水** / **奖励已耗用→异常清单** → **8 并发抢最后一份材料仅 1 单成功**。
+**撤销全额反向流水** / **奖励已耗用→异常清单** → **8 并发抢最后一份材料仅 1 单成功** →
+**批量计划：固定版本快照执行 / 同键只产生一个计划 / 最后一份材料 PARTIAL /
+逐序号 planNo·unitNo 可追溯 / 对账一致 / 补偿 NOOP 与重试幂等 / 取消抢占只跳未开始序号**。
 
 ---
 
@@ -98,6 +102,53 @@ bash scripts/smoke-e2e.sh
 
 ---
 
+## 2b. 批量合成计划（1–100 次，后台 worker 逐序号执行）
+
+玩家一次提交 1–100 次合成；**服务端**创建一个计划与全部子序号，固定配方版本与每次
+材料/产出快照，由后台 worker 从 MySQL 领取逐次执行。前端**不能**循环调用单次合成冒充批量。
+
+- 表：`batch_plan`（计划头：版本快照、状态、计数、停止闸 `stop_new_units`、取消标记）、
+  `plan_unit`（逐序号：`PENDING→RUNNING→DEDUCTED→DONE/SKIPPED/FAILED`，租约 `lease_owner/lease_expires_at`）、
+  `repair_record`（修复幂等台账）。每个子序号仍写**原有 `craft_order`**（带 `plan_no/unit_no`）
+  与**原有 `ledger_entry`**（同样追加 `plan_no/unit_no`），完全可追溯。
+- 幂等创建：同一 `Idempotency-Key` 的并发创建都竞争 `idempotency_record` 的唯一 INSERT，
+  只有一个产生计划；其余在途返回 `409 RETRY_IN_FLIGHT`，完成后回放同一份响应。
+
+### 三个持久化检查点（每个独立事务），崩溃后凭持久化状态恢复
+
+| 阶段 | 事务内动作 | 崩溃窗口恢复 |
+|------|-----------|-------------|
+| Tx1 扣料 | CAS `PENDING→RUNNING`(写租约+建 craft_order) → 行锁条件扣料 `qty>=need`、写 CONSUME/占用行 → CAS `RUNNING→DEDUCTED` | 无 CONSUME 行：租约过期后整序号重来，背包无任何变化 |
+| Tx2 发奖 | 按计划快照发产出、写 PRODUCE（`(ref,player,item,type)` 唯一键）、合成单 `PREOCCUPIED→COMMITTED` | “**已扣料未发奖**”：补发；PRODUCE 已存在则跳过，**绝不发第二次** |
+| Tx3 回写 | CAS `DEDUCTED→DONE`、清租约，计划行锁下重算计数与终态 | “**已发奖未回写状态**”：只补写 DONE，奖励不重发 |
+
+worker 可多实例并行：领取是**行锁 + 租约 CAS**，状态迁移全是条件 UPDATE（CAS），
+材料/产出唯一约束兜底；同一序号最多扣料、发奖各一次。租约（默认 30s）过期后任意 worker
+可接管，正确性不依赖某个进程，也不依赖 JVM 锁/按钮禁用。
+
+### 停止闸与取消（玩家取消与 worker 抢占同时发生）
+
+活动结束、材料不足或玩家取消都只置 `stop_new_units=1`：**不再启动新序号**，
+已预占（已领租约）的序号仍按**绑定版本**跑完。取消只把尚未开始的 `PENDING` 序号置 `SKIPPED`；
+已扣料/已完成的奖励**不回滚**。计划终态明确为：
+`COMPLETED`（全部完成）、`PARTIAL`（部分完成，含取消时已有完成）、`CANCELLED`（完成 0）、
+`FAILED`（存在不可恢复失败），并记录已完成/失败/未执行数量。
+
+### 对账与运营修复（只追加补偿流水，不改写历史）
+
+- `GET /api/operator/reconcile/{planNo}`：只读比对**计划/序号状态、合成单状态、背包净变动、
+  流水**（如 `MISSING_PRODUCE`、`LEDGER_NET_MISMATCH`、`PLAN_STATUS_MISMATCH`）；
+  `GET /api/operator/reconcile` 给出全部异常计划队列。
+- `POST /api/operator/repairs`：修复**只能新增补偿流水** `COMPENSATE` 补齐缺失一侧
+  （补产出：补背包+PRODUCE；补扣料：`qty>=need` 条件扣减+CONSUME），状态类问题只做 CAS 修正；
+  **从不 UPDATE/DELETE 历史流水**。修复请求的 `Idempotency-Key` 是唯一键（先“占键”后“补偿”
+  两阶段事务），同一请求并发或重试都只产生一笔补偿，安全重试。
+
+保留既有单次合成、版本发布、超时释放、奖励撤销；批量子任务的占用行不参与单次超时清扫。
+
+---
+
+
 ## 3. HTTP 接口（节选）
 
 鉴权：登录返回 token，后续请求带头 `X-Auth-Token: <token>`；写请求带头 `Idempotency-Key: <uuid>`。
@@ -110,11 +161,20 @@ bash scripts/smoke-e2e.sh
 - `GET  /crafts`、`GET /crafts/{orderNo}`（含 holds + 全量流水）
 - `GET  /inventory`、`GET /ledger`
 
+- `POST /plans` `{recipeId,totalUnits:1..100}`（带 `Idempotency-Key`；同键只产生一个计划）
+- `POST /plans/cancel` `{planNo,reason}`（只取消尚未开始的序号）
+- `GET  /plans`、`GET  /plans/{planNo}`（实时进度 + 逐序号时间线 + planNo/unitNo 流水）
+
 运营（`/api/operator/**`，仅 OPERATOR）
 - `GET/POST /recipes`、`POST /recipes/new-version`、`POST /recipes/draft`、`POST /recipes/publish`、`POST /recipes/close`
 - `GET  /crafts`、`GET  /ledger?refNo=`
 - `POST /revokes` `{orderNo}`、`GET /revokes`、`GET /exceptions`
 - `POST /inventory/grant`（测试/补库存，附 GRANT 审计流水）
+
+- `GET  /plans`、`GET  /plans/{planNo}`（批量计划监控与逐序号/租约视图）
+- `GET  /reconcile`（异常计划队列）、`GET  /reconcile/{planNo}`（只读对账差异）
+- `POST /repairs` `{idempotencyKey,planNo,unitNo,issueType,itemCode}`（追加补偿流水，可安全重试）
+- `GET  /repairs?planNo=`（补偿结果台账）
 
 公共：`POST /api/auth/login` `{username,password}`
 
@@ -136,8 +196,8 @@ npm run build      # 产物 dist/
 发布到后端单端口：把 `dist/*` 拷到 `backend/src/main/resources/static/`（已内置一份）。
 
 操作台包含：
-- 玩家：配方版本与**合成预览**（每行材料的需要/持有/其他单占用/缺口）、预占倒计时、背包、**按合成单逐笔材料去向**、最近流水。
-- 运营：配方多版本管理（草稿/发布/归档，已发布只读）、账本监控（按单号查流水）、撤销与**异常清单**、库存工具。
+- 玩家：配方版本与**合成预览**、预占倒计时、背包、按合成单逐笔材料去向、最近流水，以及**批量合成计划**面板（提交 1–100 次、取消未开始序号、实时进度条与**逐序号时间线**，3s 自动刷新）。
+- 运营：配方多版本管理、账本监控、撤销与异常清单、库存工具，以及**批量计划/对账**页（异常计划队列、只读对账差异、一键追加补偿修复、补偿结果台账、逐序号租约时间线）。
 
 ---
 

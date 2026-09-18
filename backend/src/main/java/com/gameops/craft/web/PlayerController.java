@@ -6,7 +6,10 @@ import com.gameops.craft.repo.LedgerRepository;
 import com.gameops.craft.repo.OrderRepository;
 import com.gameops.craft.service.CraftService;
 import com.gameops.craft.service.CraftTxService;
+import com.gameops.craft.service.PlanService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.servlet.http.HttpServletRequest;
@@ -28,15 +31,18 @@ public class PlayerController {
 
     private final CraftService craft;
     private final CraftTxService tx;
+    private final PlanService plans;
     private final InventoryRepository inventory;
     private final OrderRepository orders;
     private final LedgerRepository ledger;
     private final HoldRepository holds;
 
-    public PlayerController(CraftService craft, CraftTxService tx, InventoryRepository inventory,
-                            OrderRepository orders, LedgerRepository ledger, HoldRepository holds) {
+    public PlayerController(CraftService craft, CraftTxService tx, PlanService plans,
+                            InventoryRepository inventory, OrderRepository orders,
+                            LedgerRepository ledger, HoldRepository holds) {
         this.craft = craft;
         this.tx = tx;
+        this.plans = plans;
         this.inventory = inventory;
         this.orders = orders;
         this.ledger = ledger;
@@ -46,6 +52,9 @@ public class PlayerController {
     public record PreoccupyRequest(@NotNull Long recipeId) {}
     public record CommitRequest(@NotBlank String orderNo) {}
     public record CancelRequest(@NotBlank String orderNo, String reason) {}
+    public record CreatePlanRequest(@NotNull Long recipeId,
+                                    @NotNull @Min(1) @Max(100) Integer totalUnits) {}
+    public record CancelPlanRequest(@NotBlank String planNo, String reason) {}
 
     @GetMapping("/recipes")
     public List<Map<String, Object>> recipeCatalog(HttpServletRequest request) {
@@ -106,5 +115,35 @@ public class PlayerController {
             return craft.orderDetail(playerId, orderNo);
         }
         return ledger.listByPlayer(playerId, Math.min(limit, 500));
+    }
+
+    // ---- batch synthesis plans --------------------------------------------
+
+    /**
+     * Submit a batch of 1..100 syntheses. The SERVER creates one plan + unit rows and fixes
+     * the recipe snapshot; background workers execute them. Frontends must NOT loop single
+     * crafts to impersonate a batch — this endpoint is the only batch entry point.
+     */
+    @PostMapping("/plans")
+    public Map<String, Object> createPlan(@Valid @RequestBody CreatePlanRequest req,
+                                          @RequestHeader(value = "Idempotency-Key", required = false) String key,
+                                          HttpServletRequest request) {
+        return plans.createPlan(CurrentUsers.from(request).userId(), req.recipeId(), req.totalUnits(), key);
+    }
+
+    @PostMapping("/plans/cancel")
+    public Map<String, Object> cancelPlan(@Valid @RequestBody CancelPlanRequest req,
+                                          HttpServletRequest request) {
+        return plans.cancel(CurrentUsers.from(request).userId(), req.planNo(), req.reason());
+    }
+
+    @GetMapping("/plans")
+    public List<Map<String, Object>> myPlans(HttpServletRequest request) {
+        return plans.myPlans(CurrentUsers.from(request).userId());
+    }
+
+    @GetMapping("/plans/{planNo}")
+    public Map<String, Object> planDetail(@PathVariable String planNo, HttpServletRequest request) {
+        return plans.planDetail(CurrentUsers.from(request).userId(), planNo);
     }
 }

@@ -168,5 +168,64 @@ check "$(echo "$FINAL" | jq -r '[.items[]|select(.itemCode|startswith("MAT_"))|.
 rm -rf $TMP
 
 echo
+echo "== 12. 批量合成计划：快照执行 / 部分完成 / 取消抢占 / 对账修复幂等 =="
+# player3(id=4)：烈焰之剑当前版本需要 iron3/core2/shard1；只发恰好 2 份，请求 4 次 -> PARTIAL 2+2
+# NOTE: avoid top-level `set --` (it rewrites the script's positional params); split with read.
+while read -r ITEM QTY; do
+  jpost "$OPS" /api/operator/inventory/grant \
+    "{\"playerId\":$P3_ID,\"itemCode\":\"$ITEM\",\"qty\":$QTY}" >/dev/null
+done <<'ITEMS'
+MAT_IRON 6
+MAT_MAGIC_CORE 4
+MAT_FIRE_SHARD 2
+ITEMS
+PLANKEY=$(uuid)
+PLAN=$(jpost "$P3" /api/player/plans '{"recipeId":1,"totalUnits":4}' "$PLANKEY")
+PLANNO=$(echo "$PLAN" | jq -r .planNo)
+# recipe1: original v1 was archived by the section-11 republish; the bound snapshot is that live version.
+BOUNDV=$(echo "$PLAN" | jq -r .boundVersionNo)
+[ "$BOUNDV" -ge 2 ] && ok "批量计划绑定创建时版本 v$BOUNDV" || bad "批量计划版本异常 v$BOUNDV"
+PREPLAY=$(jpost "$P3" /api/player/plans '{"recipeId":1,"totalUnits":4}' "$PLANKEY")
+check "$(echo "$PREPLAY" | jq -r .planNo)" "$PLANNO" "同键并发/重试只产生一个计划"
+echo "   等待 4s 让后台 worker 逐序号执行…"; sleep 4
+PD=$(jget "$P3" /api/player/plans/$PLANNO)
+check "$(echo "$PD" | jq -r .status)" "PARTIAL" "最后一份材料导致 PARTIAL"
+check "$(echo "$PD" | jq -r .completedCount)" "2" "已完成 2 个序号"
+check "$(echo "$PD" | jq -r .skippedCount)" "2" "未执行 2 个序号"
+echo "$PD" | jq -e '([.units[]|select(.status=="DONE")]|length==2)
+                  and ([.units[]|select(.status=="SKIPPED")]|length==2)' >/dev/null \
+  && ok "逐序号时间线 2 DONE / 2 SKIPPED" || bad "序号状态异常"
+P3INV2=$(jget "$P3" /api/player/inventory)
+check "$(invq "$P3INV2" EQP_FIRE_SWORD)" "2" "恰发 2 份产出，无超发"
+check "$(echo "$PD" | jq '[.units[]|select(.status=="DONE")|.orderNo]|unique|length')" "2" "每序号关联独立原合成单号"
+echo "$PD" | jq -e '[.ledger[]|select(.entryType=="CONSUME" or .entryType=="PRODUCE")]
+                  | all(.planNo!=null and .unitNo!=null)' >/dev/null \
+  && ok "子任务流水均带 planNo/unitNo 可追溯标识" || bad "流水缺少 planNo/unitNo"
+
+# 对账：部分完成但一致
+RC=$(jget "$OPS" /api/operator/reconcile/$PLANNO)
+check "$(echo "$RC" | jq -r .consistent)" "true" "PARTIAL 计划对账一致"
+
+# 修复：无缺失时为 NOOP，同键重试回放、绝不产生第二笔
+RPKEY=$(uuid)
+RP1=$(jpost "$OPS" /api/operator/repairs \
+  "{\"idempotencyKey\":\"$RPKEY\",\"planNo\":\"$PLANNO\",\"unitNo\":1,\"issueType\":\"MISSING_PRODUCE\",\"itemCode\":\"EQP_FIRE_SWORD\"}" "$RPKEY")
+check "$(echo "$RP1" | jq -r .result)" "NOOP" "无差异修复返回 NOOP（不改写历史）"
+RP2=$(jpost "$OPS" /api/operator/repairs \
+  "{\"idempotencyKey\":\"$RPKEY\",\"planNo\":\"$PLANNO\",\"unitNo\":1,\"issueType\":\"MISSING_PRODUCE\",\"itemCode\":\"EQP_FIRE_SWORD\"}" "$RPKEY")
+check "$(echo "$RP2" | jq -r .replayed)" "true" "同键修复重试安全回放"
+check "$(jget "$OPS" "/api/operator/repairs?planNo=$PLANNO" | jq 'length')" "1" "修复台账仅一条，无第二笔补偿"
+
+# 取消抢占：player2(id=3) 在冒烟速成品上提 3 次后立刻取消，未开始序号全部 SKIPPED
+CPLAN=$(jpost "$P2" /api/player/plans "{\"recipeId\":$QID,\"totalUnits\":3}" "$(uuid)")
+CPLANNO=$(echo "$CPLAN" | jq -r .planNo)
+CC=$(jpost "$P2" /api/player/plans/cancel "{\"planNo\":\"$CPLANNO\",\"reason\":\"smoke cancel\"}")
+check "$(echo "$CC" | jq -r .status)" "CANCELLED" "未开始即取消 -> CANCELLED"
+check "$(echo "$CC" | jq -r .skippedCount)" "3" "3 个未开始序号全部跳过"
+check "$(jget "$P2" /api/player/inventory | jq -r '.items[]|select(.itemCode=="MAT_WOOD").qty')" "5" "取消未扣任何材料"
+echo "   等待 3s 验证 worker 不会复活已取消序号…"; sleep 3
+check "$(jget "$P2" /api/player/plans/$CPLANNO | jq -r .status)" "CANCELLED" "已取消计划不被 worker 复活"
+
+echo
 echo "结果：PASS=$PASS FAIL=$FAIL"
 [ $FAIL -eq 0 ]

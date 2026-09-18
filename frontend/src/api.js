@@ -78,6 +78,14 @@ export const api = {
   cancel: (orderNo, reason) =>
     request('POST', '/api/player/crafts/cancel', { orderNo, reason }),
 
+  // ---- player batch plans ----
+  createPlan: (recipeId, totalUnits, key) =>
+    request('POST', '/api/player/plans', { recipeId, totalUnits }, { 'Idempotency-Key': key }),
+  cancelPlan: (planNo, reason) =>
+    request('POST', '/api/player/plans/cancel', { planNo, reason }),
+  myPlans: () => request('GET', '/api/player/plans'),
+  planDetail: (no) => request('GET', `/api/player/plans/${no}`),
+
   // ---- operator ----
   opRecipes: () => request('GET', '/api/operator/recipes'),
   createRecipe: (code, name) => request('POST', '/api/operator/recipes', { code, name }),
@@ -94,7 +102,17 @@ export const api = {
   revokes: (result) => request('GET', '/api/operator/revokes' + (result ? `?result=${result}` : '')),
   exceptions: () => request('GET', '/api/operator/exceptions'),
   grant: (playerId, itemCode, qty) =>
-    request('POST', '/api/operator/inventory/grant', { playerId, itemCode, qty })
+    request('POST', '/api/operator/inventory/grant', { playerId, itemCode, qty }),
+
+  // ---- operator batch plans / reconciliation / repair ----
+  opPlans: () => request('GET', '/api/operator/plans?limit=200'),
+  opPlanDetail: (no) => request('GET', `/api/operator/plans/${no}`),
+  reconcileScan: () => request('GET', '/api/operator/reconcile'),
+  reconcilePlan: (no) => request('GET', `/api/operator/reconcile/${no}`),
+  repairs: (planNo) => request('GET', '/api/operator/repairs' + (planNo ? `?planNo=${encodeURIComponent(planNo)}` : '')),
+  repair: (payload, key) =>
+    request('POST', '/api/operator/repairs', { ...payload, idempotencyKey: payload.idempotencyKey || key },
+      key ? { 'Idempotency-Key': key } : {})
 }
 
 /** Client-generated idempotency key (crypto.randomUUID, fallback included). */

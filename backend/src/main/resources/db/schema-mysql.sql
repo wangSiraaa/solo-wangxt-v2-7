@@ -82,11 +82,14 @@ CREATE TABLE IF NOT EXISTS craft_order (
     committed_at        DATETIME(3)  NULL,
     closed_at           DATETIME(3)  NULL,
     revoke_ref_no       CHAR(20)     NULL COMMENT 'set when order is revoked',
+    plan_no             CHAR(20)     NULL COMMENT 'batch plan traceability; NULL for single craft',
+    unit_no             INT          NULL COMMENT 'unit sequence within the plan',
     created_at          DATETIME(3) NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_order_no (order_no),
     KEY ix_order_player (player_id, created_at),
-    KEY ix_order_status_deadline (status, preoccupy_deadline)
+    KEY ix_order_status_deadline (status, preoccupy_deadline),
+    KEY ix_order_plan (plan_no, unit_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Material held by a PREOCCUPIED order; released back on commit/cancel/timeout.
@@ -117,11 +120,14 @@ CREATE TABLE IF NOT EXISTS ledger_entry (
     related_ref   CHAR(20)     NULL COMMENT 'original order_no for a REVOKE reversal row',
     status        VARCHAR(16)  NOT NULL DEFAULT 'POSTED' COMMENT 'POSTED / PENDING',
     remark        VARCHAR(255) NULL,
+    plan_no       CHAR(20)     NULL COMMENT 'batch plan traceability; NULL for single craft',
+    unit_no       INT          NULL,
     created_at    DATETIME(3) NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_ledger_ref_player_item_type (ref_no, player_id, item_code, entry_type),
     KEY ix_ledger_player (player_id, created_at),
-    KEY ix_ledger_related (related_ref)
+    KEY ix_ledger_related (related_ref),
+    KEY ix_ledger_plan (plan_no, unit_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Idempotency for request retries: one key -> one outcome (replayed on repeat).
@@ -154,3 +160,75 @@ CREATE TABLE IF NOT EXISTS revoke_record (
     UNIQUE KEY uk_revoke_no (revoke_no),
     KEY ix_revoke_result (result)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================================
+-- Batch synthesis plans: one plan = N plan_units claimed/executed by workers.
+-- Recipe version and per-unit inputs/outputs are snapshotted at creation.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS batch_plan (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    plan_no           CHAR(20)     NOT NULL,
+    player_id         BIGINT       NOT NULL,
+    recipe_id         BIGINT       NOT NULL,
+    recipe_version_id BIGINT       NOT NULL,
+    total_units       INT          NOT NULL,
+    inputs_json       TEXT         NOT NULL COMMENT 'per-unit inputs snapshot',
+    outputs_json      TEXT         NOT NULL COMMENT 'per-unit outputs snapshot',
+    status            VARCHAR(16)  NOT NULL COMMENT 'PENDING/RUNNING/COMPLETED/PARTIAL/CANCELLED/FAILED',
+    status_reason     VARCHAR(255) NULL,
+    stop_new_units    TINYINT(1)   NOT NULL DEFAULT 0 COMMENT 'workers stop claiming once 1 (activity end/shortage/cancel)',
+    cancel_requested  TINYINT(1)   NOT NULL DEFAULT 0,
+    completed_count   INT          NOT NULL DEFAULT 0,
+    failed_count      INT          NOT NULL DEFAULT 0,
+    skipped_count     INT          NOT NULL DEFAULT 0,
+    created_at        DATETIME(3) NOT NULL,
+    finished_at       DATETIME(3) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_batch_plan_no (plan_no),
+    KEY ix_plan_player (player_id, created_at),
+    KEY ix_plan_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf4mb4;
+
+CREATE TABLE IF NOT EXISTS plan_unit (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    plan_id           BIGINT       NOT NULL,
+    plan_no           CHAR(20)     NOT NULL,
+    unit_no           INT          NOT NULL COMMENT '1-based sequence within the plan',
+    player_id         BIGINT       NOT NULL,
+    recipe_id         BIGINT       NOT NULL,
+    recipe_version_id BIGINT       NOT NULL COMMENT 'bound version snapshot',
+    order_no          CHAR(20)     NULL COMMENT 'craft_order created for this unit',
+    status            VARCHAR(16)  NOT NULL COMMENT 'PENDING/RUNNING/DEDUCTED/DONE/FAILED/SKIPPED',
+    status_reason     VARCHAR(255) NULL,
+    lease_owner       VARCHAR(64)  NULL,
+    lease_expires_at  DATETIME(3)  NULL,
+    attempts          INT          NOT NULL DEFAULT 0,
+    started_at        DATETIME(3) NULL,
+    deducted_at       DATETIME(3) NULL,
+    completed_at      DATETIME(3) NULL,
+    created_at        DATETIME(3) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_plan_unit_no (plan_id, unit_no),
+    UNIQUE KEY uk_plan_unit_order (order_no),
+    KEY ix_unit_claim (status, lease_expires_at),
+    KEY ix_unit_plan (plan_id, unit_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf4mb4;
+
+-- Operator reconciliation repairs; the request idempotency key prevents a second compensation.
+CREATE TABLE IF NOT EXISTS repair_record (
+    id                 BIGINT       NOT NULL AUTO_INCREMENT,
+    repair_no          CHAR(20)     NOT NULL,
+    idempotency_key    VARCHAR(80)  NOT NULL,
+    plan_no            CHAR(20)     NULL,
+    unit_no            INT          NULL,
+    order_no           CHAR(20)     NULL,
+    issue_type         VARCHAR(32)  NOT NULL COMMENT 'MISSING_PRODUCE / MISSING_CONSUME / STATUS_MISMATCH',
+    result             VARCHAR(16)  NOT NULL COMMENT 'APPLIED / NOOP',
+    detail_json        TEXT         NULL,
+    operator_id        BIGINT       NOT NULL,
+    created_at         DATETIME(3) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_repair_no (repair_no),
+    UNIQUE KEY uk_repair_idem (idempotency_key),
+    KEY ix_repair_plan (plan_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf4mb4;

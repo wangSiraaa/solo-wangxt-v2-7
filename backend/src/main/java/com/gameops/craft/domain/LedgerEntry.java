@@ -12,5 +12,7 @@ public record LedgerEntry(
         String relatedRef,
         String status,
         String remark,
+        String planNo,
+        Integer unitNo,
         Instant createdAt
 ) {}

@@ -83,3 +83,18 @@ h3 { margin: 0 0 10px; font-size: 14px; color: var(--muted); }
 }
 .flash.error { border-color: rgba(239,83,80,.5); }
 .flash.ok { border-color: rgba(47,191,113,.5); }
+
+/* batch plan progress bar */
+.tag.muted { background: rgba(143,160,192,.15); color: var(--muted); }
+.bar {
+  display: flex;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #0d1322;
+  border: 1px solid var(--line);
+}
+.bar > div { height: 100%; }
+.bar-ok { background: var(--ok); }
+.bar-bad { background: var(--bad); }
+.bar-warn { background: var(--warn); }

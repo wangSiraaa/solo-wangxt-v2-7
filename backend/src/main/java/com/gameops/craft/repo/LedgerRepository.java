@@ -23,20 +23,45 @@ public class LedgerRepository {
 
     private static LedgerEntry map(ResultSet rs) throws SQLException {
         Timestamp created = rs.getTimestamp("created_at");
+        int unitNo = rs.getInt("unit_no");
         return new LedgerEntry(rs.getLong("id"), rs.getString("ref_no"), rs.getLong("player_id"),
                 rs.getString("item_code"), rs.getString("entry_type"), rs.getLong("qty_delta"),
                 rs.getString("related_ref"), rs.getString("status"), rs.getString("remark"),
+                rs.getString("plan_no"), rs.wasNull() ? null : unitNo,
                 created == null ? null : created.toInstant());
     }
 
     public void insert(String refNo, long playerId, String itemCode, String entryType,
                        long qtyDelta, String relatedRef, String status, String remark, Instant now) {
+        insert(refNo, playerId, itemCode, entryType, qtyDelta, relatedRef, status, remark, now, null, null);
+    }
+
+    /** Batch-plan variant: every movement is traceable via (plan_no, unit_no). */
+    public void insert(String refNo, long playerId, String itemCode, String entryType,
+                       long qtyDelta, String relatedRef, String status, String remark, Instant now,
+                       String planNo, Integer unitNo) {
         jdbc.update("""
                 INSERT INTO ledger_entry
-                  (ref_no, player_id, item_code, entry_type, qty_delta, related_ref, status, remark, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (ref_no, player_id, item_code, entry_type, qty_delta, related_ref, status,
+                   remark, plan_no, unit_no, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, refNo, playerId, itemCode, entryType, qtyDelta, relatedRef, status, remark,
-                Timestamp.from(now));
+                planNo, unitNo, Timestamp.from(now));
+    }
+
+    public boolean exists(String refNo, long playerId, String itemCode, String entryType) {
+        Integer n = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM ledger_entry
+                 WHERE ref_no = ? AND player_id = ? AND item_code = ? AND entry_type = ?
+                """, Integer.class, refNo, playerId, itemCode, entryType);
+        return n != null && n > 0;
+    }
+
+    /** All rows of one batch plan (compensation rows included). */
+    public List<LedgerEntry> listByPlan(String planNo) {
+        return jdbc.query(
+                "SELECT * FROM ledger_entry WHERE plan_no = ? ORDER BY unit_no, id",
+                MAPPER, planNo);
     }
 
     public List<LedgerEntry> listByRef(String refNo) {

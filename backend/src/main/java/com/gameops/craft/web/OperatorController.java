@@ -1,12 +1,17 @@
 package com.gameops.craft.web;
 
 import com.gameops.craft.common.DocNumbers;
+import com.gameops.craft.common.ApiException;
 import com.gameops.craft.repo.InventoryRepository;
 import com.gameops.craft.repo.LedgerRepository;
 import com.gameops.craft.repo.OrderRepository;
+import com.gameops.craft.repo.BatchPlanRepository;
+import com.gameops.craft.repo.RepairRepository;
 import com.gameops.craft.repo.RevokeRepository;
 import com.gameops.craft.service.CraftService;
 import com.gameops.craft.service.CraftTxService;
+import com.gameops.craft.service.PlanService;
+import com.gameops.craft.service.ReconcileService;
 import com.gameops.craft.service.RecipeAdminService;
 import com.gameops.craft.domain.ItemQty;
 import jakarta.validation.Valid;
@@ -23,6 +28,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -37,17 +43,27 @@ public class OperatorController {
     private final OrderRepository orders;
     private final LedgerRepository ledger;
     private final RevokeRepository revokes;
+    private final BatchPlanRepository batchPlans;
+    private final PlanService planService;
+    private final ReconcileService reconcile;
+    private final RepairRepository repairRepo;
     private final Clock clock;
 
     public OperatorController(RecipeAdminService recipeAdmin, CraftTxService craftTx,
                               InventoryRepository inventory, OrderRepository orders,
-                              LedgerRepository ledger, RevokeRepository revokes, Clock clock) {
+                              LedgerRepository ledger, RevokeRepository revokes,
+                              BatchPlanRepository batchPlans, PlanService planService,
+                              ReconcileService reconcile, RepairRepository repairRepo, Clock clock) {
         this.recipeAdmin = recipeAdmin;
         this.craftTx = craftTx;
         this.inventory = inventory;
         this.orders = orders;
         this.ledger = ledger;
         this.revokes = revokes;
+        this.batchPlans = batchPlans;
+        this.planService = planService;
+        this.reconcile = reconcile;
+        this.repairRepo = repairRepo;
         this.clock = clock;
     }
 
@@ -174,5 +190,70 @@ public class OperatorController {
                 null, "POSTED", "运营设置库存", now);
         return Map.of("refNo", refNo, "playerId", req.playerId(),
                 "itemCode", req.itemCode(), "qty", req.qty());
+    }
+
+    // ---- batch plans: oversight, reconciliation, repair -------------------
+
+    @GetMapping("/plans")
+    public List<Map<String, Object>> listPlans(@RequestParam(defaultValue = "100") int limit) {
+        return batchPlans.listRecent(Math.min(limit, 500)).stream()
+                .map(PlanService::planBody).toList();
+    }
+
+    @GetMapping("/plans/{planNo}")
+    public Map<String, Object> planDetail(@PathVariable String planNo) {
+        var plan = batchPlans.findByNo(planNo)
+                .orElseThrow(() -> ApiException.notFound("PLAN_NOT_FOUND", "批量计划不存在"));
+        return planService.detail(plan);
+    }
+
+    /** Reconcile one plan: status vs inventory vs ledger differences (read only). */
+    @GetMapping("/reconcile/{planNo}")
+    public Map<String, Object> reconcile(@PathVariable String planNo) {
+        return reconcile.reconcilePlan(planNo);
+    }
+
+    /** Exception queue: every plan with at least one difference. */
+    @GetMapping("/reconcile")
+    public List<Map<String, Object>> reconcileScan() {
+        return reconcile.scanAll();
+    }
+
+    /**
+     * Operator repair entry. Safe to retry with the SAME Idempotency-Key: at most one
+     * compensating ledger entry is ever appended; history is never rewritten/deleted.
+     */
+    @PostMapping("/repairs")
+    public ReconcileService.RepairResult repair(
+            @Valid @RequestBody ReconcileService.RepairRequest req,
+            @RequestHeader(value = "Idempotency-Key", required = false) String headerKey,
+            HttpServletRequest request) {
+        // Prefer the explicit key inside the body; fall back to the header.
+        String key = req.idempotencyKey() != null && !req.idempotencyKey().isBlank()
+                ? req.idempotencyKey() : headerKey;
+        ReconcileService.RepairRequest effective = new ReconcileService.RepairRequest(
+                key, req.planNo(), req.unitNo(), req.issueType(), req.itemCode());
+        return reconcile.repair(effective, CurrentUsers.from(request).userId());
+    }
+
+    @GetMapping("/repairs")
+    public List<Map<String, Object>> repairs(@RequestParam(required = false) String planNo) {
+        List<RepairRepository.RepairRow> rows = planNo == null || planNo.isBlank()
+                ? repairRepo.listRecent(200)
+                : repairRepo.listByPlan(planNo);
+        return rows.stream().map(r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("repairNo", r.repairNo());
+            m.put("idempotencyKey", r.idempotencyKey());
+            m.put("planNo", r.planNo());
+            m.put("unitNo", r.unitNo());
+            m.put("orderNo", r.orderNo());
+            m.put("issueType", r.issueType());
+            m.put("result", r.result());
+            m.put("detail", CraftTxService.parseShortage(r.detailJson()));
+            m.put("operatorId", r.operatorId());
+            m.put("createdAt", r.createdAt());
+            return m;
+        }).toList();
     }
 }

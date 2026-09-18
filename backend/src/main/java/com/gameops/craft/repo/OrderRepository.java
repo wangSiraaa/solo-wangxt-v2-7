@@ -51,13 +51,19 @@ public class OrderRepository {
 
     public long insert(String orderNo, long playerId, long recipeId, long versionId,
                        Instant deadline, Instant now) {
+        return insert(orderNo, playerId, recipeId, versionId, deadline, now, null, null);
+    }
+
+    /** Batch-plan variant: every unit order carries plan_no/unit_no traceability. */
+    public long insert(String orderNo, long playerId, long recipeId, long versionId,
+                       Instant deadline, Instant now, String planNo, Integer unitNo) {
         jdbc.update("""
                 INSERT INTO craft_order
                   (order_no, player_id, recipe_id, recipe_version_id, status,
-                   preoccupy_deadline, committed_at, closed_at, created_at)
-                VALUES (?, ?, ?, ?, 'PREOCCUPIED', ?, NULL, NULL, ?)
+                   preoccupy_deadline, committed_at, closed_at, plan_no, unit_no, created_at)
+                VALUES (?, ?, ?, ?, 'PREOCCUPIED', ?, NULL, NULL, ?, ?, ?)
                 """, orderNo, playerId, recipeId, versionId,
-                Timestamp.from(deadline), Timestamp.from(now));
+                Timestamp.from(deadline), planNo, unitNo, Timestamp.from(now));
         return jdbc.queryForObject("SELECT id FROM craft_order WHERE order_no = ?", Long.class, orderNo);
     }
 
@@ -103,8 +109,40 @@ public class OrderRepository {
                 """, Timestamp.from(now), orderId, Timestamp.from(now));
     }
 
-    public int casRevoke(long orderId, String revokeNo, Instant now) {
+    /**
+     * Batch-unit commit: no deadline check (the unit is driven by the plan lease, not the
+     * single-craft preoccupy window). PREOCCUPIED -> COMMITTED exactly once.
+     */
+    public int casCommitBatchUnit(long orderId, Instant now) {
         return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'COMMITTED', committed_at = ?, closed_at = ?
+                 WHERE id = ? AND status = 'PREOCCUPIED'
+                """, Timestamp.from(now), Timestamp.from(now), orderId);
+    }
+
+    /** A claimed-but-never-deducted unit whose plan stopped (shortage/cancel): close its order. */
+    public int casCancelBatchUnitByNo(String orderNo, String reason, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'CANCELLED', status_reason = ?, closed_at = ?
+                 WHERE order_no = ? AND status = 'PREOCCUPIED' AND plan_no IS NOT NULL
+                """, reason, Timestamp.from(now), orderNo);
+    }
+
+    /** Cancel the orders of units bulk-skipped by a plan stop (claim/cancel race); portable subquery. */
+    public int cancelOpenOrdersOfSkippedUnits(long planId, String reason, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'CANCELLED', status_reason = ?, closed_at = ?
+                 WHERE plan_no = (SELECT plan_no FROM plan_unit WHERE plan_id = ? LIMIT 1)
+                   AND status = 'PREOCCUPIED'
+                   AND order_no IN (SELECT order_no FROM plan_unit
+                                     WHERE plan_id = ? AND status = 'SKIPPED' AND order_no IS NOT NULL)
+                """, reason, Timestamp.from(now), planId, planId);
+    }
+
+    public int casRevoke(long orderId, String revokeNo, Instant now) {        return jdbc.update("""
                 UPDATE craft_order
                    SET status = 'REVOKED', revoke_ref_no = ?, closed_at = ?
                  WHERE id = ? AND status = 'COMMITTED'
@@ -116,7 +154,11 @@ public class OrderRepository {
                 MAPPER, playerId, limit);
     }
 
-    /** Orders the timeout sweeper should try to close. */
+    /**
+     * Orders the timeout sweeper should try to close.
+     * Batch-plan units are excluded: their holds belong to the plan_unit state machine
+     * (DEDUCTED recovery), never to the single-craft preoccupy timeout flow.
+     */
     public List<CraftOrder> listExpiredPreoccupied(Instant now, int batch) {
         return jdbc.query("""
                 SELECT o.*, rv.version_no AS version_no, r.code AS recipe_code, r.name AS recipe_name
@@ -124,6 +166,7 @@ public class OrderRepository {
                   JOIN recipe r ON r.id = o.recipe_id
                   JOIN recipe_version rv ON rv.id = o.recipe_version_id
                  WHERE o.status = 'PREOCCUPIED' AND o.preoccupy_deadline < ?
+                       AND o.plan_no IS NULL
                  ORDER BY o.id LIMIT ?
                 """, (rs, n) -> map(rs), Timestamp.from(now), batch);
     }
